@@ -36,7 +36,7 @@ build (R8-shrunk, signed with the debug key); install it with `adb install` or f
 Pushing a `v*` tag also publishes the APKs as a GitHub release.
 
 The same workflow's `manjaro-smoke` job unpacks the Manjaro ARM rootfs on an arm64 runner and runs
-the app's setup there under proot (mirrors, keyrings, kernel removal, the package list).
+the app's setup steps there in a chroot (mirrors, keyrings, kernel removal, the package list).
 
 ## Building locally
 
