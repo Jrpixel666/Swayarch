@@ -33,7 +33,7 @@ Needs an arm64 phone with Android 10 or newer.
 Every push builds it in GitHub Actions (`.github/workflows/build.yml`): open the latest **build**
 run under Actions and download the `swayarch-apk` artifact. `swayarch-0.11.0.apk` is the release
 build (R8-shrunk, signed with the debug key); install it with `adb install` or from the phone.
-Pushing a `v*` tag also publishes the APKs as a GitHub release.
+Pushing a `v*` tag, or running the **build** workflow by hand with a release tag, publishes the APKs as a GitHub release.
 
 The same workflow's `manjaro-smoke` job unpacks the Manjaro ARM rootfs on an arm64 runner and runs
 the app's setup steps there in a chroot (mirrors, keyrings, kernel removal, the package list).

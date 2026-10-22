@@ -2,13 +2,19 @@ name: build
 
 # Builds the Swayarch APK: proot from Termux's source (scripts/fetch-proot.sh), the tests, and
 # debug and release APKs (the release one signed with the debug key unless keystore.properties
-# exists). Pushing a v* tag also attaches the APKs to a GitHub release.
+# exists). Pushing a v* tag, or running it by hand with a release tag, also publishes the APKs as
+# a GitHub release; run by hand, it creates the tag at the commit it built.
 on:
   push:
     branches: ['**']
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag to create and publish a release for, e.g. v1.0 (empty: build only)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -62,10 +68,24 @@ jobs:
           path: out/
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" out/* --title "Swayarch $GITHUB_REF_NAME" --notes "Debug-signed build. Install swayarch-*.apk on an arm64 phone with Android 10+."
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" out/* --target "$GITHUB_SHA" --title "Swayarch $TAG" --notes-file - <<'NOTES'
+          Manjaro Sway's look on an Android home screen, with optional Manjaro ARM under proot (no root).
+
+          - Install `swayarch-0.11.0.apk` (release build, debug-signed) on an arm64 phone with Android 10+;
+            `swayarch-0.11.0-debug.apk` is the debuggable build. `SHA256SUMS` has their checksums.
+          - First run: pick a theme and "desktop only" or "desktop and manjaro"; until Manjaro is
+            installed, every start asks again (switch off in settings › linux).
+          - Manjaro ARM (arm-stable) installs in the background: ~1 GB download, 3 GB space. Firmware and
+            kernel modules are never unpacked.
+          - 12 Manjaro Sway themes with its wallpaper, OWL widgets, every Linux window its own Android task.
+
+          Based on Omalauncher 0.11.0 by Simon Schubert (MIT); themes and tweaks from manjaro-sway 202610180719 (GPL).
+          NOTES
 
   # What the app does to a fresh rootfs, on an arm64 runner: unpack without firmware and kernel
   # modules, Bootstrap's mirrors and pacman.conf, the keyrings, the kernel removal and a package
