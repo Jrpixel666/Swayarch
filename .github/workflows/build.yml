@@ -106,7 +106,7 @@ jobs:
       - name: Keyrings, kernel removal, packages
         run: |
           # A chroot: Ubuntu's proot crashes on the runner's kernel, and the app ships its own (Termux's) anyway.
-          for d in dev proc sys; do sudo mount --bind /$d rootfs/$d; done
+          for d in dev proc sys; do sudo mkdir -p rootfs/$d && sudo mount --bind /$d rootfs/$d; done
           g() { sudo chroot rootfs /usr/bin/env -i HOME=/root \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/bin LANG=C.UTF-8 /bin/bash -c "cd /root && $1"; }
           g 'pacman-key --init && pacman-key --populate $(for k in archlinuxarm manjaro manjaro-arm; do [ -f /usr/share/pacman/keyrings/$k.gpg ] && echo $k; done)'
