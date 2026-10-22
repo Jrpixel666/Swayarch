@@ -1,0 +1,117 @@
+name: build
+
+# Builds the Swayarch APK: proot from Termux's source (scripts/fetch-proot.sh), the tests, and
+# debug and release APKs (the release one signed with the debug key unless keystore.properties
+# exists). Pushing a v* tag also attaches the APKs to a GitHub release.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # The NDK app/build.gradle.kts pins, installed up front so AGP doesn't download it mid-build.
+      - name: Install the NDK
+        run: |
+          ndk=$(sed -n 's/^NDK_VERSION=//p' scripts/fetch-proot.sh)
+          [ -d "$ANDROID_HOME/ndk/$ndk" ] || yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk" >/dev/null
+
+      - name: Fetch proot
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq libarchive-tools
+          scripts/fetch-proot.sh
+
+      - name: Check the Manjaro ARM rootfs is downloadable
+        run: |
+          url=$(sed -n 's/^private const val ROOTFS_URL = "\(.*\)"/\1/p' app/src/main/kotlin/dev/omalauncher/linux/Bootstrap.kt)
+          curl -fsSIL "$url" | grep -iE '^(HTTP|content-length)' | tail -2
+
+      - name: Test
+        run: ./gradlew :owl:test :app:testDebugUnitTest
+
+      - name: Build
+        run: ./gradlew :app:assembleDebug :app:assembleRelease
+
+      - name: Collect the APKs
+        run: |
+          name=$(sed -n 's/^ *versionName = "\(.*\)"/\1/p' app/build.gradle.kts)
+          mkdir -p out
+          cp app/build/outputs/apk/release/app-release.apk "out/swayarch-$name.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "out/swayarch-$name-debug.apk"
+          (cd out && sha256sum *.apk > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: swayarch-apk
+          path: out/
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/* --title "Swayarch $GITHUB_REF_NAME" --notes "Debug-signed build. Install swayarch-*.apk on an arm64 phone with Android 10+."
+
+  # What the app does to a fresh rootfs, on an arm64 runner: unpack without firmware and kernel
+  # modules, Bootstrap's mirrors and pacman.conf, the keyrings, the kernel removal and a package
+  # install, all under proot without root. Catches a moved rootfs URL or dead mirrors early.
+  manjaro-smoke:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install proot
+        run: sudo apt-get update -q && sudo apt-get install -yq proot libarchive-tools
+      - name: Download and unpack Manjaro ARM
+        run: |
+          url=$(sed -n 's/^private const val ROOTFS_URL = "\(.*\)"/\1/p' app/src/main/kotlin/dev/omalauncher/linux/Bootstrap.kt)
+          curl -fsSL "$url" -o rootfs.tar.gz
+          ls -la rootfs.tar.gz
+          mkdir rootfs
+          bsdtar -xpf rootfs.tar.gz -C rootfs --exclude 'boot' --exclude 'boot/*' --exclude 'dev/*' \
+            --exclude 'usr/lib/firmware/*' --exclude 'usr/lib/modules/*' --exclude './boot' --exclude './dev/*' \
+            --exclude './usr/lib/firmware/*' --exclude './usr/lib/modules/*'
+          cat rootfs/etc/os-release
+      - name: Configure like Bootstrap.configure
+        run: |
+          kt=app/src/main/kotlin/dev/omalauncher/linux/Bootstrap.kt
+          branch=$(sed -n 's/^private const val BRANCH = "\(.*\)"/\1/p' $kt)
+          printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | sudo tee rootfs/etc/resolv.conf >/dev/null
+          {
+            sed -n '/^private val MIRRORS/,/^    )/p' $kt | grep -o '"https[^"]*"' | tr -d '"' |
+              while read -r m; do echo "Server = $m/$branch/\$repo/\$arch"; done
+            grep '^Server' rootfs/etc/pacman.d/mirrorlist || true
+          } > mirrorlist
+          cat mirrorlist
+          sudo cp mirrorlist rootfs/etc/pacman.d/mirrorlist
+          noextract=$(sed -n 's/^private const val NO_EXTRACT = "\(.*\)"/\1/p' $kt)
+          sudo sed -i -E '/^(DownloadUser|CheckSpace|DisableSandbox|DisableDownloadTimeout|NoExtract)\b/d' rootfs/etc/pacman.conf
+          sudo sed -i "0,/^\[options\]/s|^\[options\]|[options]\nDisableSandbox\nDisableDownloadTimeout\n$noextract|" rootfs/etc/pacman.conf
+          grep -A4 '^\[options\]' rootfs/etc/pacman.conf
+      - name: Keyrings, kernel removal, packages
+        run: |
+          g() { sudo proot -0 -r rootfs -b /dev -b /proc -b /sys -w /root /usr/bin/env -i HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/bin LANG=C.UTF-8 /bin/bash -c "$1"; }
+          g 'pacman-key --init && pacman-key --populate $(for k in archlinuxarm manjaro manjaro-arm; do [ -f /usr/share/pacman/keyrings/$k.gpg ] && echo $k; done)'
+          g 'pkgs=$(pacman -Ql | awk '"'"'$2 ~ "^/usr/lib/(firmware|modules)/" { print $1 }'"'"' | sort -u); echo "kernel/firmware: ${pkgs:-none}"; [ -z "$pkgs" ] || pacman -Rdd --noconfirm $pkgs; true'
+          # Bootstrap's PACKAGES, the list the app installs.
+          pkgs=$(sed -n '/^private val PACKAGES/,/^    )/p' app/src/main/kotlin/dev/omalauncher/linux/Bootstrap.kt | grep -o '"[^"]*"' | tr -d '"' | tr '\n' ' ')
+          echo "installing: $pkgs"
+          g "pacman -Syu --noconfirm --needed $pkgs"
+          g 'fastfetch --pipe -l none | head -20'
+          test ! -e rootfs/usr/lib/firmware/brcm && echo "no firmware unpacked"

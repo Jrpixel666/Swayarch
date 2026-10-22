@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Imports Manjaro Sway's themes and tweaks into the app's assets.
+
+Reads a checkout (or unpacked release tarball) of github.com/manjaro-sway/manjaro-sway, e.g.
+https://github.com/manjaro-sway/manjaro-sway/archive/refs/tags/202610180719.tar.gz, and writes:
+
+- app/src/main/assets/themes/manjaro-<name>.toml: each theme's colors, for the theme picker
+- app/src/main/assets/manjaro-themes/<name>/colors.toml and wallpaper.svg: the theme as the
+  launcher installs it (ui wallpaper rendered on the phone, see theme/ManjaroThemes.kt)
+- app/src/main/assets/manjaro-tweaks/: files copied into the Manjaro guest (linux/ManjaroTweaks.kt)
+
+Usage: scripts/import-manjaro-sway.py <manjaro-sway checkout>
+"""
+
+import re
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ASSETS = ROOT / "app/src/main/assets"
+
+SET = re.compile(r"^\s*set\s+\$([A-Za-z0-9_-]+)\s+(.+?)\s*$")
+HEX = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+
+def sway_vars(text):
+    """`set $name value` lines, with `$other` references resolved in order, as sway does."""
+    out = {}
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        m = SET.match(line)
+        if not m:
+            continue
+        name, value = m.groups()
+        value = re.sub(r"\$([A-Za-z0-9_-]+)", lambda r: out.get(r.group(1), r.group(0)), value)
+        out[name] = value
+    return out
+
+
+def foot_colors(text):
+    """The colors of a foot theme: the section initial-color-theme names (or [colors]) over the others."""
+    sections = {}
+    section = ""
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip() if not raw.strip().startswith("#") else ""
+        if not line:
+            continue
+        if line.startswith("["):
+            section = line.strip("[]")
+            continue
+        if "=" in line:
+            k, v = (s.strip() for s in line.split("=", 1))
+            sections.setdefault(section, {})[k] = v
+    mode = sections.get("main", {}).get("initial-color-theme", "dark")
+    colors = {}
+    for name in ("colors", "colors-light" if mode == "light" else "colors-dark"):
+        colors.update(sections.get(name, {}))
+    return mode, colors
+
+
+def hexcolor(value):
+    if value is None:
+        return None
+    m = HEX.match(value.strip().split()[0])
+    return "#" + m.group(1).lower() if m else None
+
+
+def mix(a, b, amount):
+    x = [int(a[i : i + 2], 16) for i in (1, 3, 5)]
+    y = [int(b[i : i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join("%02x" % int(x[i] * (1 - amount) + y[i] * amount + 0.5) for i in range(3))
+
+
+def theme_colors(conf_text, foot_text):
+    v = sway_vars(conf_text)
+    mode, foot = foot_colors(foot_text)
+    background = hexcolor(v.get("background-color")) or hexcolor(foot.get("background")) or "#141a1b"
+    foreground = hexcolor(v.get("text-color")) or hexcolor(foot.get("foreground")) or "#eeeeee"
+    accent = hexcolor(v.get("accent-color")) or hexcolor(foot.get("regular2")) or "#16a085"
+    term = {}
+    for kind in ("regular", "bright"):
+        for n in range(8):
+            term[f"{kind}{n}"] = hexcolor(foot.get(f"{kind}{n}"))
+    dark = mode != "light"
+    lift = "#ffffff" if dark else "#000000"
+    c = {
+        "mode": "dark" if dark else "light",
+        "accent": accent,
+        "selection": hexcolor(foot.get("selection-background")) or hexcolor(v.get("selection-color")) or mix(background, lift, 0.15),
+        "muted": term["bright0"] or mix(foreground, background, 0.5),
+        "background": background,
+        "dark_background": mix(background, "#000000", 0.25 if dark else 0.05),
+        "darker_background": mix(background, "#000000", 0.5 if dark else 0.1),
+        "lighter_background": mix(background, lift, 0.08),
+        "foreground": foreground,
+        "dark_foreground": mix(foreground, background, 0.55),
+        "light_foreground": mix(foreground, background, 0.2),
+        "bright_foreground": (term["bright7"] or foreground) if dark else foreground,
+    }
+    names = ["red", "green", "yellow", "blue", "magenta", "cyan"]
+    for i, name in enumerate(names, start=1):
+        c[name] = term[f"regular{i}"] or accent
+        c[f"bright_{name}"] = term[f"bright{i}"] or c[name]
+    c["orange"] = hexcolor(v.get("peach")) or hexcolor(v.get("color9")) or mix(c["red"], c["yellow"], 0.5)
+    c["brown"] = mix(c["orange"], "#000000", 0.5)
+    return c
+
+
+def toml(colors, source):
+    order = [
+        "mode", "", "accent", "selection", "muted", "", "background", "dark_background", "darker_background",
+        "lighter_background", "", "foreground", "dark_foreground", "light_foreground", "bright_foreground", "",
+        "red", "yellow", "orange", "green", "cyan", "blue", "magenta", "brown", "", "bright_red", "bright_yellow",
+        "bright_green", "bright_cyan", "bright_blue", "bright_magenta",
+    ]
+    lines = [f"# Generated by scripts/import-manjaro-sway.py from {source}", ""]
+    lines += [f'{k} = "{colors[k]}"' if k else "" for k in order]
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit(__doc__)
+    src = Path(sys.argv[1]).resolve()
+    payload = src / "packages/manjaro-sway-settings/payload"
+    sway = payload / "usr/share/sway"
+    if not sway.is_dir():
+        sys.exit(f"{src} doesn't look like a manjaro-sway checkout")
+    svg = (sway / "templates/manjarosway-scalable.svg").read_text()
+
+    themes = {"sway": (payload / "etc/skel/.config/sway/definitions.d/theme.conf", payload / "etc/skel/.config/foot/foot-theme.ini")}
+    for d in sorted((sway / "themes").iterdir()):
+        if (d / "theme.conf").is_file() and (d / "foot-theme.ini").is_file():
+            themes[d.name] = (d / "theme.conf", d / "foot-theme.ini")
+
+    out_themes = ASSETS / "manjaro-themes"
+    shutil.rmtree(out_themes, ignore_errors=True)
+    for old in (ASSETS / "themes").glob("manjaro-*.toml"):
+        old.unlink()
+    for name, (conf, foot) in themes.items():
+        colors = theme_colors(conf.read_text(), foot.read_text())
+        rel = conf.relative_to(src)
+        text = toml(colors, f"manjaro-sway/{rel}")
+        full = f"manjaro-{name}"
+        (ASSETS / "themes" / f"{full}.toml").write_text(text)
+        d = out_themes / full
+        d.mkdir(parents=True)
+        (d / "colors.toml").write_text(text)
+        # generate-bg.sh: the Manjaro Sway crown in the accent, the root in the text color.
+        art = svg.replace("${CROWN}", colors["accent"]).replace("${ROOT}", colors["foreground"]).replace("${BACKGROUND}", colors["background"])
+        (d / "wallpaper.svg").write_text(art)
+        print(f"{full}: {colors['mode']} accent {colors['accent']}")
+
+    # Tweaks for the guest: Manjaro Sway's helper commands, its theme sources, and the session
+    # environment that still applies when the launcher, not sway, is the compositor.
+    tweaks = ASSETS / "manjaro-tweaks"
+    shutil.rmtree(tweaks, ignore_errors=True)
+    for tool in ("mjr", "termpaste", "termbin"):
+        dst = tweaks / "usr/local/bin" / tool
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(payload / "usr/bin" / tool, dst)
+    shutil.copytree(sway / "themes", tweaks / "usr/share/manjaro-sway/themes")
+    shutil.copytree(sway / "templates", tweaks / "usr/share/manjaro-sway/templates")
+    for f in ("helix/config.toml", "nvim/after/plugin/set_title.lua", "swappy/config", "calcurse/conf"):
+        dst = tweaks / "etc/skel/.config" / f
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(payload / "etc/skel/.config" / f, dst)
+    profile = tweaks / "etc/profile.d/manjaro-sway.sh"
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text(
+        "# Manjaro Sway's session environment (etc/skel/.profile), minus what only sway itself uses.\n"
+        "# Installed by Swayarch; edit ~/.config/profile.d/*.sh for your own.\n"
+        "export MOZ_ENABLE_WAYLAND=1\n"
+        "export MOZ_DBUS_REMOTE=1\n"
+        "export GTK_CSD=0\n"
+        "if [ -e /usr/lib/libgtk-nocsd.so ]; then\n"
+        '\texport LD_PRELOAD="/usr/lib/libgtk-nocsd.so${LD_PRELOAD:+:$LD_PRELOAD}"\n'
+        "fi\n"
+        'export QT_QPA_PLATFORM="wayland"\n'
+        'export QT_WAYLAND_DISABLE_WINDOWDECORATION="1"\n'
+        "export _JAVA_AWT_WM_NONREPARENTING=1\n"
+        "export ELECTRON_OZONE_PLATFORM_HINT=wayland\n"
+        "export OPENCV_LOG_LEVEL=ERROR\n"
+        'alias ssh="TERM=xterm-256color ssh"\n'
+        'if [ -n "$(ls "$HOME"/.config/profile.d 2>/dev/null)" ]; then\n'
+        '\tfor f in "$HOME"/.config/profile.d/*; do . "$f"; done\n'
+        "fi\n"
+    )
+    (tweaks / "SOURCE").write_text(f"manjaro-sway/packages/manjaro-sway-settings (GPL), imported from {src.name}\n")
+    print(f"tweaks: {sum(1 for p in tweaks.rglob('*') if p.is_file())} files")
+
+
+if __name__ == "__main__":
+    main()
