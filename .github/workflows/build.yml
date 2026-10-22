@@ -69,14 +69,14 @@ jobs:
 
   # What the app does to a fresh rootfs, on an arm64 runner: unpack without firmware and kernel
   # modules, Bootstrap's mirrors and pacman.conf, the keyrings, the kernel removal and a package
-  # install, all under proot without root. Catches a moved rootfs URL or dead mirrors early.
+  # install, in a chroot. Catches a moved rootfs URL or dead mirrors early.
   manjaro-smoke:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - name: Install proot
-        run: sudo apt-get update -q && sudo apt-get install -yq proot libarchive-tools
+      - name: Install bsdtar
+        run: sudo apt-get update -q && sudo apt-get install -yq libarchive-tools
       - name: Download and unpack Manjaro ARM
         run: |
           url=$(sed -n 's/^private const val ROOTFS_URL = "\(.*\)"/\1/p' app/src/main/kotlin/dev/omalauncher/linux/Bootstrap.kt)
@@ -105,8 +105,10 @@ jobs:
           grep -A4 '^\[options\]' rootfs/etc/pacman.conf
       - name: Keyrings, kernel removal, packages
         run: |
-          g() { sudo proot -0 -r rootfs -b /dev -b /proc -b /sys -w /root /usr/bin/env -i HOME=/root \
-            PATH=/usr/local/sbin:/usr/local/bin:/usr/bin LANG=C.UTF-8 /bin/bash -c "$1"; }
+          # A chroot: Ubuntu's proot crashes on the runner's kernel, and the app ships its own (Termux's) anyway.
+          for d in dev proc sys; do sudo mount --bind /$d rootfs/$d; done
+          g() { sudo chroot rootfs /usr/bin/env -i HOME=/root \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/bin LANG=C.UTF-8 /bin/bash -c "cd /root && $1"; }
           g 'pacman-key --init && pacman-key --populate $(for k in archlinuxarm manjaro manjaro-arm; do [ -f /usr/share/pacman/keyrings/$k.gpg ] && echo $k; done)'
           g 'pkgs=$(pacman -Ql | awk '"'"'$2 ~ "^/usr/lib/(firmware|modules)/" { print $1 }'"'"' | sort -u); echo "kernel/firmware: ${pkgs:-none}"; [ -z "$pkgs" ] || pacman -Rdd --noconfirm $pkgs; true'
           # Bootstrap's PACKAGES, the list the app installs.
